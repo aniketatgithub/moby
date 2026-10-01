@@ -19,6 +19,7 @@ import (
 	"github.com/moby/moby/v2/daemon/internal/rootless"
 	"github.com/moby/moby/v2/pkg/sysinfo"
 	"github.com/pkg/errors"
+	rkapi "github.com/rootless-containers/rootlesskit/v3/pkg/api"
 	rkclient "github.com/rootless-containers/rootlesskit/v3/pkg/api/client"
 )
 
@@ -221,13 +222,9 @@ func (daemon *Daemon) fillRootlessVersion(ctx context.Context, v *system.Version
 	if !rootless.RunningWithRootlessKit() {
 		return nil
 	}
-	rlc, err := getRootlessKitClient()
+	rlInfo, err := getRootlessKitInfo(ctx)
 	if err != nil {
-		return errors.Wrap(err, "failed to create RootlessKit client")
-	}
-	rlInfo, err := rlc.Info(ctx)
-	if err != nil {
-		return errors.Wrap(err, "failed to retrieve RootlessKit version")
+		return err
 	}
 	rlV := system.ComponentVersion{
 		Name:    "rootlesskit",
@@ -301,6 +298,26 @@ func (daemon *Daemon) fillRootlessVersion(ctx context.Context, v *system.Version
 		}
 	}
 	return nil
+}
+
+// getRootlessKitInfo returns the RootlessKit version information.
+//
+// The RootlessKit client builds a fresh http.Transport on every call, and
+// nothing ever releases its idle connections, so each call leaks one
+// connection to the RootlessKit API socket on both ends. Close the idle
+// connections before returning.
+// See https://github.com/moby/moby/issues/53814.
+func getRootlessKitInfo(ctx context.Context) (*rkapi.Info, error) {
+	rlc, err := getRootlessKitClient()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create RootlessKit client")
+	}
+	defer rlc.HTTPClient().CloseIdleConnections()
+	rlInfo, err := rlc.Info(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to retrieve RootlessKit version")
+	}
+	return rlInfo, nil
 }
 
 // getRootlessKitClient returns RootlessKit client

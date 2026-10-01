@@ -3,7 +3,14 @@
 package daemon
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -127,4 +134,67 @@ spec: 1.0.0
 		assert.Equal(t, tc.version, version)
 		assert.Equal(t, tc.commit, commit)
 	}
+}
+
+// countingListener wraps a net.Listener and tracks how many accepted
+// connections are still open.
+type countingListener struct {
+	net.Listener
+	open *atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.open.Add(1)
+	return &countingConn{Conn: c, onClose: func() { l.open.Add(-1) }}, nil
+}
+
+type countingConn struct {
+	net.Conn
+	closed  atomic.Bool
+	onClose func()
+}
+
+func (c *countingConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) {
+		c.onClose()
+	}
+	return c.Conn.Close()
+}
+
+// TestGetRootlessKitInfoClosesConnections is a regression test for
+// https://github.com/moby/moby/issues/53814: every version lookup created a
+// new RootlessKit client (and with it a fresh http.Transport) whose idle
+// connection to the RootlessKit API socket was never released, leaking one
+// connection per call on both dockerd and rootlesskit.
+func TestGetRootlessKitInfoClosesConnections(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "api.sock")
+
+	var openConns atomic.Int32
+	ln, err := net.Listen("unix", sock)
+	assert.NilError(t, err)
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"apiVersion":"1.1.3","version":"3.2.0","stateDir":"/tmp/fake"}`)
+		}),
+	}
+	go func() { _ = srv.Serve(&countingListener{Listener: ln, open: &openConns}) }()
+	defer func() { _ = srv.Close() }()
+
+	t.Setenv("ROOTLESSKIT_STATE_DIR", filepath.Dir(sock))
+
+	info, err := getRootlessKitInfo(context.Background())
+	assert.NilError(t, err)
+	assert.Equal(t, "3.2.0", info.Version)
+
+	// The server only notices the close once it happens; poll briefly.
+	deadline := time.Now().Add(5 * time.Second)
+	for openConns.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Equal(t, int32(0), openConns.Load(), "connection to the RootlessKit API socket was not released")
 }
